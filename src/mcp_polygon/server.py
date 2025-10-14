@@ -6,7 +6,7 @@ from mcp.types import ToolAnnotations
 from polygon import RESTClient
 from importlib.metadata import version, PackageNotFoundError
 
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "")
 if not POLYGON_API_KEY:
@@ -24,6 +24,95 @@ polygon_client.headers["User-Agent"] += f" {version_number}"
 poly_mcp = FastMCP("Polygon", dependencies=["polygon"])
 
 
+# ========================================
+# Helper Functions for Better LLM Experience
+# ========================================
+
+
+def _validate_ticker(ticker: str) -> bool:
+    """
+    Validate ticker format.
+
+    Args:
+        ticker: Ticker symbol to validate
+
+    Returns:
+        True if valid format
+    """
+    if not ticker or not isinstance(ticker, str):
+        return False
+    # Basic validation - alphanumeric and some special chars
+    return len(ticker) >= 1 and len(ticker) <= 20
+
+
+def _format_date_for_api(date_input: Union[str, datetime, date]) -> str:
+    """
+    Convert various date formats to API-friendly YYYY-MM-DD string.
+
+    Args:
+        date_input: Date as string, datetime, or date object
+
+    Returns:
+        Date string in YYYY-MM-DD format
+    """
+    if isinstance(date_input, str):
+        return date_input
+    elif isinstance(date_input, datetime):
+        return date_input.strftime("%Y-%m-%d")
+    elif isinstance(date_input, date):
+        return date_input.strftime("%Y-%m-%d")
+    return str(date_input)
+
+
+def _get_date_range_default(days_back: int = 30) -> tuple[str, str]:
+    """
+    Get default date range for queries (today minus N days to today).
+
+    Args:
+        days_back: Number of days to go back from today
+
+    Returns:
+        Tuple of (from_date, to_date) as YYYY-MM-DD strings
+    """
+    today = date.today()
+    from_date = today - timedelta(days=days_back)
+    return from_date.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
+
+
+def _build_error_response(error: Exception, context: str = "") -> Dict[str, Any]:
+    """
+    Build a helpful error response with context for LLMs.
+
+    Args:
+        error: The exception that occurred
+        context: Additional context about what was being attempted
+
+    Returns:
+        Error response dictionary with helpful message
+    """
+    error_msg = str(error)
+    response = {"error": error_msg, "status": "failed"}
+
+    if context:
+        response["context"] = context
+
+    # Add helpful hints based on error type
+    if "401" in error_msg or "Unauthorized" in error_msg:
+        response["hint"] = (
+            "API key may be invalid or missing. Check POLYGON_API_KEY environment variable."
+        )
+    elif "404" in error_msg or "Not Found" in error_msg:
+        response["hint"] = "Resource not found. Check ticker symbol or date is valid."
+    elif "429" in error_msg or "rate limit" in error_msg.lower():
+        response["hint"] = "API rate limit exceeded. Wait a moment before retrying."
+    elif "400" in error_msg or "Bad Request" in error_msg:
+        response["hint"] = (
+            "Invalid request parameters. Check date formats (YYYY-MM-DD) and parameter values."
+        )
+
+    return response
+
+
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_aggs(
     ticker: str,
@@ -31,13 +120,46 @@ async def get_aggs(
     timespan: str,
     from_: Union[str, int, datetime, date],
     to: Union[str, int, datetime, date],
-    adjusted: Optional[bool] = None,
-    sort: Optional[str] = None,
-    limit: Optional[int] = None,
+    adjusted: Optional[bool] = True,
+    sort: Optional[str] = "desc",
+    limit: Optional[int] = 5000,
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    List aggregate bars for a ticker over a given date range in custom time window sizes.
+    Get aggregate bars (OHLCV data) for a stock/crypto ticker over a date range.
+
+    This returns Open, High, Low, Close, and Volume data aggregated over custom time windows.
+    Perfect for historical price analysis, charting, and backtesting.
+
+    Args:
+        ticker: Stock symbol (e.g., "AAPL", "TSLA") or crypto pair (e.g., "X:BTCUSD")
+        multiplier: Size of the time window (e.g., 1, 5, 15, 60)
+        timespan: Time unit for the window - Options: "minute", "hour", "day", "week", "month", "quarter", "year"
+        from_: Start date - Use YYYY-MM-DD format (e.g., "2024-01-01"), datetime object, or Unix timestamp
+        to: End date - Use YYYY-MM-DD format (e.g., "2024-12-31"), datetime object, or Unix timestamp
+        adjusted: Whether to adjust for splits/dividends (True = split-adjusted prices, recommended for accuracy)
+        sort: Sort order - "asc" (oldest first) or "desc" (newest first)
+        limit: Maximum number of results to return (default: 5000, max: 50000)
+        params: Additional query parameters as a dictionary
+
+    Returns:
+        JSON response with results array containing aggregate bars, each with:
+        - o: Open price
+        - h: High price
+        - l: Low price
+        - c: Close price
+        - v: Volume
+        - t: Timestamp (Unix milliseconds)
+
+    Example Usage:
+        - Daily bars: get_aggs("AAPL", 1, "day", "2024-01-01", "2024-01-31")
+        - 5-minute bars: get_aggs("TSLA", 5, "minute", "2024-01-15", "2024-01-15")
+        - Weekly bars: get_aggs("MSFT", 1, "week", "2023-01-01", "2024-01-01")
+
+    Related Tools:
+        - list_aggs: Same as get_aggs but returns an iterator for large datasets
+        - get_daily_open_close_agg: Get single day's OHLC for a specific date
+        - get_previous_close_agg: Get previous trading day's OHLC
     """
     try:
         results = polygon_client.get_aggs(
@@ -57,7 +179,7 @@ async def get_aggs(
         data_str = results.data.decode("utf-8")
         return json.loads(data_str)
     except Exception as e:
-        return {"error": str(e)}
+        return _build_error_response(e, f"Getting aggregates for {ticker}")
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -67,13 +189,49 @@ async def list_aggs(
     timespan: str,
     from_: Union[str, int, datetime, date],
     to: Union[str, int, datetime, date],
-    adjusted: Optional[bool] = None,
-    sort: Optional[str] = None,
-    limit: Optional[int] = None,
+    adjusted: Optional[bool] = True,
+    sort: Optional[str] = "desc",
+    limit: Optional[int] = 5000,
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Iterate through aggregate bars for a ticker over a given date range.
+    List aggregate bars (OHLCV data) for a stock/crypto ticker as an iterator.
+
+    This is similar to get_aggs but optimized for handling large datasets by returning
+    results as an iterator. Ideal for processing historical data in chunks or when you
+    need to handle datasets that might exceed memory limits.
+
+    Args:
+        ticker: Stock symbol (e.g., "AAPL", "TSLA") or crypto pair (e.g., "X:BTCUSD")
+        multiplier: Size of the time window (e.g., 1, 5, 15, 60)
+        timespan: Time unit for the window - Options: "minute", "hour", "day", "week", "month", "quarter", "year"
+        from_: Start date - Use YYYY-MM-DD format (e.g., "2024-01-01"), datetime object, or Unix timestamp
+        to: End date - Use YYYY-MM-DD format (e.g., "2024-12-31"), datetime object, or Unix timestamp
+        adjusted: Whether to adjust for splits/dividends (True = split-adjusted prices, recommended for accuracy). Default: True
+        sort: Sort order - "asc" (oldest first) or "desc" (newest first). Default: "desc"
+        limit: Maximum number of results to return (default: 5000, max: 50000)
+        params: Additional query parameters as a dictionary
+
+    Returns:
+        JSON response with results array containing aggregate bars, each with:
+        - o: Open price
+        - h: High price
+        - l: Low price
+        - c: Close price
+        - v: Volume
+        - t: Timestamp (Unix milliseconds)
+        - vw: Volume weighted average price (if available)
+        - n: Number of transactions (if available)
+
+    Example Usage:
+        - Daily bars for year: list_aggs("AAPL", 1, "day", "2024-01-01", "2024-12-31")
+        - Hourly bars: list_aggs("TSLA", 1, "hour", "2024-01-01", "2024-01-31")
+        - Monthly bars: list_aggs("MSFT", 1, "month", "2020-01-01", "2024-01-01")
+
+    Related Tools:
+        - get_aggs: Non-iterator version for smaller datasets
+        - get_daily_open_close_agg: Get single day's OHLC for a specific date
+        - get_previous_close_agg: Get previous trading day's OHLC
     """
     try:
         results = polygon_client.list_aggs(
@@ -92,7 +250,7 @@ async def list_aggs(
         data_str = results.data.decode("utf-8")
         return json.loads(data_str)
     except Exception as e:
-        return {"error": str(e)}
+        return _build_error_response(e, f"Listing aggregates for {ticker}")
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -128,11 +286,42 @@ async def get_grouped_daily_aggs(
 async def get_daily_open_close_agg(
     ticker: str,
     date: str,
-    adjusted: Optional[bool] = None,
+    adjusted: Optional[bool] = True,
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Get daily open, close, high, and low for a specific ticker and date.
+    Get the OHLC (Open, High, Low, Close) data for a specific ticker on a specific date.
+
+    This returns a snapshot of a ticker's trading activity for a single day, including
+    opening price, high, low, closing price, volume, and other key metrics. Perfect for
+    getting detailed daily statistics for a specific historical date.
+
+    Args:
+        ticker: Stock symbol (e.g., "AAPL", "TSLA", "GOOGL")
+        date: Trading date in YYYY-MM-DD format (e.g., "2024-01-15", "2024-12-31")
+        adjusted: Whether to adjust for splits/dividends (True = split-adjusted prices, recommended). Default: True
+        params: Additional query parameters as a dictionary
+
+    Returns:
+        JSON response containing:
+        - symbol: Ticker symbol
+        - open: Opening price
+        - high: Highest price during the day
+        - low: Lowest price during the day
+        - close: Closing price
+        - volume: Total trading volume
+        - afterHours: After-hours trading price (if available)
+        - preMarket: Pre-market trading price (if available)
+
+    Example Usage:
+        - Get Apple's data for specific date: get_daily_open_close_agg("AAPL", "2024-01-15")
+        - Get Tesla's data: get_daily_open_close_agg("TSLA", "2024-03-20")
+        - Unadjusted data: get_daily_open_close_agg("MSFT", "2024-01-15", adjusted=False)
+
+    Related Tools:
+        - get_previous_close_agg: Get previous trading day's OHLC
+        - get_aggs: Get OHLC data for a date range
+        - list_aggs: Iterator version for large datasets
     """
     try:
         results = polygon_client.get_daily_open_close_agg(
@@ -142,17 +331,47 @@ async def get_daily_open_close_agg(
         data_str = results.data.decode("utf-8")
         return json.loads(data_str)
     except Exception as e:
-        return {"error": str(e)}
+        return _build_error_response(e, f"Getting daily OHLC for {ticker} on {date}")
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_previous_close_agg(
     ticker: str,
-    adjusted: Optional[bool] = None,
+    adjusted: Optional[bool] = True,
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Get previous day's open, close, high, and low for a specific ticker.
+    Get the previous trading day's OHLC data for a specific ticker.
+
+    This retrieves the most recent completed trading day's open, high, low, close, and volume
+    data. Useful for getting the latest daily snapshot without needing to specify a date.
+    Automatically handles weekends and market holidays.
+
+    Args:
+        ticker: Stock symbol (e.g., "AAPL", "TSLA", "MSFT")
+        adjusted: Whether to adjust for splits/dividends (True = split-adjusted prices, recommended). Default: True
+        params: Additional query parameters as a dictionary
+
+    Returns:
+        JSON response containing:
+        - T: Ticker symbol
+        - o: Opening price
+        - h: Highest price during the day
+        - l: Lowest price during the day
+        - c: Closing price
+        - v: Total trading volume
+        - vw: Volume weighted average price
+        - t: Timestamp (Unix milliseconds)
+
+    Example Usage:
+        - Get Apple's previous close: get_previous_close_agg("AAPL")
+        - Get Tesla's previous close: get_previous_close_agg("TSLA")
+        - Unadjusted data: get_previous_close_agg("MSFT", adjusted=False)
+
+    Related Tools:
+        - get_daily_open_close_agg: Get OHLC for a specific date
+        - get_aggs: Get OHLC data for a date range
+        - get_snapshot_ticker: Get real-time snapshot with current price
     """
     try:
         results = polygon_client.get_previous_close_agg(
@@ -162,7 +381,7 @@ async def get_previous_close_agg(
         data_str = results.data.decode("utf-8")
         return json.loads(data_str)
     except Exception as e:
-        return {"error": str(e)}
+        return _build_error_response(e, f"Getting previous close for {ticker}")
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -173,13 +392,52 @@ async def list_trades(
     timestamp_lte: Optional[Union[str, int, datetime, date]] = None,
     timestamp_gt: Optional[Union[str, int, datetime, date]] = None,
     timestamp_gte: Optional[Union[str, int, datetime, date]] = None,
-    limit: Optional[int] = None,
+    limit: Optional[int] = 100,
     sort: Optional[str] = None,
-    order: Optional[str] = None,
+    order: Optional[str] = "desc",
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Get trades for a ticker symbol.
+    List individual trades for a ticker symbol with detailed execution information.
+
+    This returns the tick-by-tick trade data showing every individual trade execution,
+    including price, size, exchange, and timestamp. Perfect for detailed trade analysis,
+    order flow studies, and high-frequency data analysis.
+
+    Args:
+        ticker: Stock symbol (e.g., "AAPL", "TSLA", "MSFT")
+        timestamp: Exact timestamp for trades - Use YYYY-MM-DD format, datetime object, or Unix timestamp (nanoseconds)
+        timestamp_lt: Get trades before this timestamp (less than)
+        timestamp_lte: Get trades before or at this timestamp (less than or equal)
+        timestamp_gt: Get trades after this timestamp (greater than)
+        timestamp_gte: Get trades after or at this timestamp (greater than or equal)
+        limit: Maximum number of trades to return (default: 100, max: 50000)
+        sort: Field to sort by (e.g., "timestamp")
+        order: Sort order - "asc" (oldest first) or "desc" (newest first). Default: "desc"
+        params: Additional query parameters as a dictionary
+
+    Returns:
+        JSON response with results array containing individual trades, each with:
+        - t: Timestamp (nanoseconds)
+        - y: Exchange timestamp
+        - f: TRF timestamp
+        - q: Sequence number
+        - i: Trade ID
+        - x: Exchange code
+        - s: Trade size (shares)
+        - c: Trade conditions
+        - p: Trade price
+        - z: Tape (which SIP feed)
+
+    Example Usage:
+        - Recent trades: list_trades("AAPL", limit=50)
+        - Trades on specific date: list_trades("TSLA", timestamp_gte="2024-01-15", timestamp_lt="2024-01-16")
+        - Oldest first: list_trades("MSFT", limit=100, order="asc")
+
+    Related Tools:
+        - get_last_trade: Get only the most recent trade
+        - list_quotes: Get bid/ask quotes instead of trades
+        - get_last_quote: Get most recent quote
     """
     try:
         results = polygon_client.list_trades(
@@ -199,7 +457,7 @@ async def list_trades(
         data_str = results.data.decode("utf-8")
         return json.loads(data_str)
     except Exception as e:
-        return {"error": str(e)}
+        return _build_error_response(e, f"Listing trades for {ticker}")
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -208,7 +466,39 @@ async def get_last_trade(
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Get the most recent trade for a ticker symbol.
+    Get the most recent trade execution for a ticker symbol.
+
+    This retrieves the very latest trade that occurred for a stock, providing real-time
+    or near-real-time trade information including price, size, exchange, and exact timestamp.
+    Ideal for checking the last traded price and volume.
+
+    Args:
+        ticker: Stock symbol (e.g., "AAPL", "TSLA", "MSFT")
+        params: Additional query parameters as a dictionary
+
+    Returns:
+        JSON response containing the last trade with:
+        - T: Ticker symbol
+        - t: Timestamp (nanoseconds)
+        - y: Exchange timestamp
+        - f: TRF timestamp
+        - q: Sequence number
+        - i: Trade ID
+        - x: Exchange code where trade occurred
+        - s: Trade size (number of shares)
+        - c: Array of trade conditions/flags
+        - p: Trade price
+        - z: Tape (which SIP feed: 1=A, 2=B, 3=C)
+
+    Example Usage:
+        - Get last Apple trade: get_last_trade("AAPL")
+        - Get last Tesla trade: get_last_trade("TSLA")
+        - Get last Microsoft trade: get_last_trade("MSFT")
+
+    Related Tools:
+        - list_trades: Get multiple trades with filtering
+        - get_last_quote: Get most recent bid/ask quote
+        - get_snapshot_ticker: Get comprehensive snapshot including last trade
     """
     try:
         results = polygon_client.get_last_trade(ticker=ticker, params=params, raw=True)
@@ -216,7 +506,7 @@ async def get_last_trade(
         data_str = results.data.decode("utf-8")
         return json.loads(data_str)
     except Exception as e:
-        return {"error": str(e)}
+        return _build_error_response(e, f"Getting last trade for {ticker}")
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -247,13 +537,56 @@ async def list_quotes(
     timestamp_lte: Optional[Union[str, int, datetime, date]] = None,
     timestamp_gt: Optional[Union[str, int, datetime, date]] = None,
     timestamp_gte: Optional[Union[str, int, datetime, date]] = None,
-    limit: Optional[int] = None,
+    limit: Optional[int] = 100,
     sort: Optional[str] = None,
-    order: Optional[str] = None,
+    order: Optional[str] = "desc",
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Get quotes for a ticker symbol.
+    List NBBO quotes for a ticker symbol with bid/ask pricing over time.
+
+    This returns historical tick-by-tick quote data showing the National Best Bid and Offer
+    (NBBO) at different points in time. Each quote shows what buyers were willing to pay
+    (bid) and what sellers were asking (ask). Perfect for analyzing spread patterns,
+    liquidity, and order book dynamics.
+
+    Args:
+        ticker: Stock symbol (e.g., "AAPL", "TSLA", "MSFT")
+        timestamp: Exact timestamp for quotes - Use YYYY-MM-DD format, datetime object, or Unix timestamp (nanoseconds)
+        timestamp_lt: Get quotes before this timestamp (less than)
+        timestamp_lte: Get quotes before or at this timestamp (less than or equal)
+        timestamp_gt: Get quotes after this timestamp (greater than)
+        timestamp_gte: Get quotes after or at this timestamp (greater than or equal)
+        limit: Maximum number of quotes to return (default: 100, max: 50000)
+        sort: Field to sort by (e.g., "timestamp")
+        order: Sort order - "asc" (oldest first) or "desc" (newest first). Default: "desc"
+        params: Additional query parameters as a dictionary
+
+    Returns:
+        JSON response with results array containing quotes, each with:
+        - t: Timestamp (nanoseconds)
+        - y: Exchange timestamp
+        - f: TRF timestamp
+        - q: Sequence number
+        - x: Bid exchange code
+        - X: Ask exchange code
+        - p: Bid price
+        - P: Ask price
+        - s: Bid size (shares)
+        - S: Ask size (shares)
+        - c: Quote conditions/flags
+        - i: Indicators
+        - z: Tape (which SIP feed)
+
+    Example Usage:
+        - Recent quotes: list_quotes("AAPL", limit=50)
+        - Quotes on specific date: list_quotes("TSLA", timestamp_gte="2024-01-15", timestamp_lt="2024-01-16")
+        - Oldest first: list_quotes("MSFT", limit=100, order="asc")
+
+    Related Tools:
+        - get_last_quote: Get only the most recent quote
+        - list_trades: Get trade executions instead of quotes
+        - get_last_trade: Get most recent trade
     """
     try:
         results = polygon_client.list_quotes(
@@ -273,7 +606,7 @@ async def list_quotes(
         data_str = results.data.decode("utf-8")
         return json.loads(data_str)
     except Exception as e:
-        return {"error": str(e)}
+        return _build_error_response(e, f"Listing quotes for {ticker}")
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -282,7 +615,42 @@ async def get_last_quote(
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Get the most recent quote for a ticker symbol.
+    Get the most recent NBBO (National Best Bid and Offer) quote for a ticker.
+
+    This retrieves the latest bid/ask quote showing what buyers are willing to pay and
+    what sellers are asking. The NBBO represents the best available prices across all
+    exchanges. Perfect for checking current market sentiment and spread.
+
+    Args:
+        ticker: Stock symbol (e.g., "AAPL", "TSLA", "MSFT")
+        params: Additional query parameters as a dictionary
+
+    Returns:
+        JSON response containing the last quote with:
+        - T: Ticker symbol
+        - t: Timestamp (nanoseconds)
+        - y: Exchange timestamp
+        - f: TRF timestamp
+        - q: Sequence number
+        - i: Indicator/quote condition
+        - x: Bid exchange code
+        - X: Ask exchange code
+        - p: Bid price
+        - P: Ask price
+        - s: Bid size (shares)
+        - S: Ask size (shares)
+        - c: Quote conditions/flags
+        - z: Tape (which SIP feed)
+
+    Example Usage:
+        - Get current Apple bid/ask: get_last_quote("AAPL")
+        - Get Tesla quote: get_last_quote("TSLA")
+        - Get Microsoft quote: get_last_quote("MSFT")
+
+    Related Tools:
+        - list_quotes: Get multiple historical quotes
+        - get_last_trade: Get most recent trade execution
+        - get_snapshot_ticker: Get comprehensive snapshot including quote
     """
     try:
         results = polygon_client.get_last_quote(ticker=ticker, params=params, raw=True)
@@ -290,7 +658,7 @@ async def get_last_quote(
         data_str = results.data.decode("utf-8")
         return json.loads(data_str)
     except Exception as e:
-        return {"error": str(e)}
+        return _build_error_response(e, f"Getting last quote for {ticker}")
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -426,7 +794,43 @@ async def get_snapshot_ticker(
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Get snapshot for a specific ticker.
+    Get a real-time snapshot of current market data for a specific ticker.
+
+    This provides a comprehensive view of a ticker's current state, combining the latest
+    trade, quote, minute bar, and daily bar into a single response. Perfect for getting
+    a complete picture of a security's current market activity all at once.
+
+    Args:
+        market_type: Type of market - Options: "stocks", "crypto", "forex", "otc", "indices"
+        ticker: Ticker symbol - Format depends on market_type:
+                - Stocks: "AAPL", "TSLA", "MSFT"
+                - Crypto: "X:BTCUSD", "X:ETHUSD"
+                - Forex: "C:EURUSD", "C:USDJPY"
+                - Indices: "I:SPX", "I:DJI"
+        params: Additional query parameters as a dictionary
+
+    Returns:
+        JSON response containing comprehensive snapshot data:
+        - ticker: The ticker symbol
+        - todaysChange: Dollar change from previous close
+        - todaysChangePerc: Percentage change from previous close
+        - updated: Last update timestamp (nanoseconds)
+        - day: Today's aggregated data (open, high, low, close, volume, vwap)
+        - min: Latest minute bar data
+        - prevDay: Previous day's aggregated data
+        - lastTrade: Most recent trade details (price, size, timestamp, exchange)
+        - lastQuote: Most recent NBBO quote (bid, ask, bidSize, askSize)
+
+    Example Usage:
+        - Stock snapshot: get_snapshot_ticker("stocks", "AAPL")
+        - Crypto snapshot: get_snapshot_ticker("crypto", "X:BTCUSD")
+        - Forex snapshot: get_snapshot_ticker("forex", "C:EURUSD")
+
+    Related Tools:
+        - get_last_trade: Get only the last trade
+        - get_last_quote: Get only the last quote
+        - get_previous_close_agg: Get previous day's OHLC
+        - get_snapshot_all: Get snapshots for all tickers in a market
     """
     try:
         results = polygon_client.get_snapshot_ticker(
@@ -436,7 +840,9 @@ async def get_snapshot_ticker(
         data_str = results.data.decode("utf-8")
         return json.loads(data_str)
     except Exception as e:
-        return {"error": str(e)}
+        return _build_error_response(
+            e, f"Getting snapshot for {ticker} in {market_type} market"
+        )
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -502,7 +908,38 @@ async def get_market_status(
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Get current trading status of exchanges and financial markets.
+    Get the current trading status of the stock market and exchanges.
+
+    This tells you whether the market is currently open, closed, or in pre/post-market
+    trading. Also provides status for different exchanges and market types. Essential
+    for knowing if you can expect real-time data or if the market is closed.
+
+    Args:
+        params: Additional query parameters as a dictionary
+
+    Returns:
+        JSON response containing market status information:
+        - market: Overall market status - "open", "closed", or "extended-hours"
+        - serverTime: Current server time (ISO 8601 format)
+        - exchanges: Object containing individual exchange statuses:
+            - nyse: New York Stock Exchange status
+            - nasdaq: NASDAQ status
+            - otc: Over-the-counter market status
+        - currencies: Forex market status
+            - fx: Foreign exchange market status
+            - crypto: Cryptocurrency market status
+        - earlyHours: Whether pre-market trading is active
+        - afterHours: Whether after-hours trading is active
+
+    Example Usage:
+        - Check if market is open: get_market_status()
+        - Verify trading hours: get_market_status()
+        - Check exchange status: get_market_status()
+
+    Related Tools:
+        - get_market_holidays: Get upcoming market holidays and closures
+        - get_snapshot_ticker: Get real-time ticker data (available during market hours)
+        - get_last_trade: Get most recent trade (may be delayed if market closed)
     """
     try:
         results = polygon_client.get_market_status(params=params, raw=True)
@@ -510,7 +947,7 @@ async def get_market_status(
         data_str = results.data.decode("utf-8")
         return json.loads(data_str)
     except Exception as e:
-        return {"error": str(e)}
+        return _build_error_response(e, "Getting market status")
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -525,12 +962,57 @@ async def list_tickers(
     search: Optional[str] = None,
     active: Optional[bool] = None,
     sort: Optional[str] = None,
-    order: Optional[str] = None,
-    limit: Optional[int] = None,
+    order: Optional[str] = "desc",
+    limit: Optional[int] = 100,
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Query supported ticker symbols across stocks, indices, forex, and crypto.
+    Search and list ticker symbols across all asset classes with flexible filtering.
+
+    This is a powerful search tool for finding tickers by symbol, company name, type,
+    exchange, or other identifiers. Returns detailed information about each ticker
+    including name, market, type, and various identifiers. Perfect for ticker discovery
+    and validation.
+
+    Args:
+        ticker: Filter by ticker symbol (exact match, e.g., "AAPL")
+        type: Filter by ticker type - Options: "CS" (Common Stock), "ETF", "ADRC" (ADR Common),
+              "ADRP" (ADR Preferred), "FUND", "SP" (Structured Product), "WARRANT", "RIGHT", "BOND"
+        market: Filter by market - Options: "stocks", "crypto", "fx", "otc", "indices"
+        exchange: Filter by exchange code (e.g., "XNAS" for NASDAQ, "XNYS" for NYSE)
+        cusip: Filter by CUSIP identifier (9-character alphanumeric security identifier)
+        cik: Filter by SEC CIK number (Central Index Key for SEC filings)
+        date: Get tickers as of specific date in YYYY-MM-DD format (e.g., "2024-01-15")
+        search: Search by ticker symbol or company name (partial match, e.g., "Apple")
+        active: Filter by active status - True for currently active tickers, False for delisted
+        sort: Field to sort by (e.g., "ticker", "name", "market")
+        order: Sort order - "asc" (A-Z) or "desc" (Z-A). Default: "desc"
+        limit: Maximum number of results to return (default: 100, max: 1000)
+        params: Additional query parameters as a dictionary
+
+    Returns:
+        JSON response with results array containing ticker information:
+        - ticker: Ticker symbol
+        - name: Company/asset name
+        - market: Market type (stocks, crypto, fx, etc.)
+        - locale: Locale (us, global)
+        - primary_exchange: Primary exchange code
+        - type: Ticker type (CS, ETF, etc.)
+        - active: Whether currently active
+        - currency_name: Currency for trading
+        - cik: SEC CIK number (if available)
+        - composite_figi: FIGI identifier (if available)
+        - share_class_figi: Share class FIGI (if available)
+
+    Example Usage:
+        - Search by name: list_tickers(search="Apple", limit=10)
+        - Find all ETFs: list_tickers(type="ETF", active=True, limit=50)
+        - Active stocks on NASDAQ: list_tickers(market="stocks", exchange="XNAS", active=True)
+
+    Related Tools:
+        - get_ticker_details: Get detailed information for a specific ticker
+        - get_snapshot_ticker: Get real-time market data for a ticker
+        - list_ticker_news: Get news articles for a ticker
     """
     try:
         results = polygon_client.list_tickers(
@@ -553,7 +1035,7 @@ async def list_tickers(
         data_str = results.data.decode("utf-8")
         return json.loads(data_str)
     except Exception as e:
-        return {"error": str(e)}
+        return _build_error_response(e, "Listing tickers")
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -563,7 +1045,55 @@ async def get_ticker_details(
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Get detailed information about a specific ticker.
+    Get comprehensive details and metadata for a specific ticker symbol.
+
+    This returns extensive information about a company or asset including business
+    description, classification, market cap, share counts, contact information, and
+    various identifiers. Essential for fundamental analysis and research.
+
+    Args:
+        ticker: Ticker symbol (e.g., "AAPL", "TSLA", "MSFT")
+        date: Get ticker details as of specific date in YYYY-MM-DD format (e.g., "2024-01-15").
+              If not specified, returns current details.
+        params: Additional query parameters as a dictionary
+
+    Returns:
+        JSON response with comprehensive ticker details:
+        - ticker: Ticker symbol
+        - name: Company/asset full name
+        - market: Market type (stocks, crypto, fx, etc.)
+        - locale: Geographic locale
+        - primary_exchange: Primary exchange code
+        - type: Security type (CS, ETF, etc.)
+        - active: Whether currently active/trading
+        - currency_name: Trading currency
+        - cik: SEC Central Index Key
+        - composite_figi: Bloomberg FIGI identifier
+        - share_class_figi: Share class FIGI
+        - market_cap: Market capitalization
+        - phone_number: Company phone number
+        - address: Physical address (street, city, state, postal_code)
+        - description: Business description
+        - sic_code: Standard Industrial Classification code
+        - sic_description: SIC description
+        - ticker_root: Root ticker symbol
+        - homepage_url: Company website
+        - total_employees: Number of employees
+        - list_date: Initial listing date
+        - branding: Logo and icon URLs
+        - share_class_shares_outstanding: Outstanding shares count
+        - weighted_shares_outstanding: Weighted average shares
+
+    Example Usage:
+        - Get Apple details: get_ticker_details("AAPL")
+        - Get historical details: get_ticker_details("TSLA", date="2023-01-01")
+        - Get ETF details: get_ticker_details("SPY")
+
+    Related Tools:
+        - list_tickers: Search for tickers
+        - get_snapshot_ticker: Get real-time market data
+        - list_ticker_news: Get news articles for the ticker
+        - list_stock_financials: Get financial statements and metrics
     """
     try:
         results = polygon_client.get_ticker_details(
@@ -573,20 +1103,58 @@ async def get_ticker_details(
         data_str = results.data.decode("utf-8")
         return json.loads(data_str)
     except Exception as e:
-        return {"error": str(e)}
+        return _build_error_response(e, f"Getting details for ticker {ticker}")
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def list_ticker_news(
     ticker: Optional[str] = None,
     published_utc: Optional[Union[str, datetime, date]] = None,
-    limit: Optional[int] = None,
-    sort: Optional[str] = None,
-    order: Optional[str] = None,
+    limit: Optional[int] = 10,
+    sort: Optional[str] = "published_utc",
+    order: Optional[str] = "desc",
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Get recent news articles for a stock ticker.
+    Get recent news articles related to a specific ticker or market-wide news.
+
+    This retrieves news articles from various publishers, including headlines, summaries,
+    article URLs, publisher info, and related tickers. Perfect for staying informed about
+    market-moving events, earnings, and company developments.
+
+    Args:
+        ticker: Filter news by ticker symbol (e.g., "AAPL", "TSLA"). If not specified, returns market-wide news.
+        published_utc: Filter news published at or after this date/time.
+                       Use YYYY-MM-DD format (e.g., "2024-01-15") or ISO 8601 datetime
+        limit: Maximum number of articles to return (default: 10, max: 1000)
+        sort: Field to sort by - Options: "published_utc" (default). Default: "published_utc"
+        order: Sort order - "asc" (oldest first) or "desc" (newest first). Default: "desc"
+        params: Additional query parameters as a dictionary
+
+    Returns:
+        JSON response with results array containing news articles:
+        - id: Unique article identifier
+        - publisher: Publisher information (name, homepage_url, logo_url, favicon_url)
+        - title: Article headline
+        - author: Article author
+        - published_utc: Publication timestamp (ISO 8601 format)
+        - article_url: Link to full article
+        - tickers: Array of related ticker symbols
+        - amp_url: AMP version URL (if available)
+        - image_url: Featured image URL
+        - description: Article summary/excerpt
+        - keywords: Array of article keywords
+        - insights: AI-generated insights and sentiment (if available)
+
+    Example Usage:
+        - Latest Apple news: list_ticker_news("AAPL", limit=5)
+        - Market news today: list_ticker_news(published_utc="2024-01-15", limit=20)
+        - Older Tesla news: list_ticker_news("TSLA", order="asc", limit=10)
+
+    Related Tools:
+        - get_ticker_details: Get company details and description
+        - get_snapshot_ticker: Get real-time market data
+        - list_tickers: Search for ticker symbols
     """
     try:
         results = polygon_client.list_ticker_news(
@@ -602,7 +1170,9 @@ async def list_ticker_news(
         data_str = results.data.decode("utf-8")
         return json.loads(data_str)
     except Exception as e:
-        return {"error": str(e)}
+        return _build_error_response(
+            e, f"Listing news for {ticker if ticker else 'market'}"
+        )
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -630,11 +1200,45 @@ async def list_splits(
     ticker: Optional[str] = None,
     execution_date: Optional[Union[str, datetime, date]] = None,
     reverse_split: Optional[bool] = None,
-    limit: Optional[int] = None,
+    limit: Optional[int] = 100,
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Get historical stock splits.
+    Get historical stock split events for analyzing share dilution and consolidation.
+
+    This retrieves stock split data showing when companies split (or reverse split) their
+    shares, including the split ratio and execution date. Essential for understanding
+    historical price adjustments and share count changes.
+
+    Args:
+        ticker: Filter by ticker symbol (e.g., "AAPL", "TSLA", "GOOGL"). If not specified, returns all splits.
+        execution_date: Filter by execution date in YYYY-MM-DD format (e.g., "2024-01-15").
+                        Returns splits executed on or after this date.
+        reverse_split: Filter by split type - True for reverse splits (consolidation),
+                       False for forward splits (dilution), None for all splits
+        limit: Maximum number of splits to return (default: 100)
+        params: Additional query parameters as a dictionary
+
+    Returns:
+        JSON response with results array containing split information:
+        - ticker: Ticker symbol
+        - execution_date: Date split was executed (YYYY-MM-DD format)
+        - split_from: Pre-split share count (numerator)
+        - split_to: Post-split share count (denominator)
+        - ratio: Split ratio (split_to / split_from)
+
+        Note: A 2-for-1 split means split_from=1, split_to=2 (each share becomes 2 shares)
+              A 1-for-2 reverse split means split_from=2, split_to=1 (every 2 shares become 1)
+
+    Example Usage:
+        - Apple's splits: list_splits("AAPL")
+        - Recent splits: list_splits(execution_date="2024-01-01", limit=50)
+        - Only reverse splits: list_splits(reverse_split=True, limit=25)
+
+    Related Tools:
+        - list_dividends: Get dividend payment history
+        - get_ticker_details: Get comprehensive ticker information
+        - get_aggs: Get price data (use adjusted=True to account for splits)
     """
     try:
         results = polygon_client.list_splits(
@@ -649,7 +1253,9 @@ async def list_splits(
         data_str = results.data.decode("utf-8")
         return json.loads(data_str)
     except Exception as e:
-        return {"error": str(e)}
+        return _build_error_response(
+            e, f"Listing splits{' for ' + ticker if ticker else ''}"
+        )
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -658,11 +1264,55 @@ async def list_dividends(
     ex_dividend_date: Optional[Union[str, datetime, date]] = None,
     frequency: Optional[int] = None,
     dividend_type: Optional[str] = None,
-    limit: Optional[int] = None,
+    limit: Optional[int] = 100,
     params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Get historical cash dividends.
+    Get historical cash dividend payments for income analysis and yield calculations.
+
+    This retrieves dividend distribution data including payment amounts, ex-dividend dates,
+    payment dates, and dividend frequency. Essential for analyzing dividend history,
+    calculating yields, and tracking income-generating investments.
+
+    Args:
+        ticker: Filter by ticker symbol (e.g., "AAPL", "MSFT", "JNJ"). If not specified, returns all dividends.
+        ex_dividend_date: Filter by ex-dividend date in YYYY-MM-DD format (e.g., "2024-01-15").
+                          Returns dividends with ex-date on or after this date.
+                          (Ex-dividend date is when stock starts trading without dividend rights)
+        frequency: Filter by payment frequency - Options:
+                   0 = One-time/special dividend
+                   1 = Annual (once per year)
+                   2 = Semi-annual (twice per year)
+                   4 = Quarterly (four times per year)
+                   12 = Monthly (twelve times per year)
+        dividend_type: Filter by dividend type - Options:
+                       "CD" = Cash dividend (most common)
+                       "SC" = Stock dividend
+                       "LT" = Long-term capital gains
+                       "ST" = Short-term capital gains
+        limit: Maximum number of dividends to return (default: 100)
+        params: Additional query parameters as a dictionary
+
+    Returns:
+        JSON response with results array containing dividend information:
+        - ticker: Ticker symbol
+        - cash_amount: Dividend amount per share (in USD)
+        - declaration_date: Date dividend was announced (YYYY-MM-DD)
+        - ex_dividend_date: Ex-dividend date - must own stock before this date (YYYY-MM-DD)
+        - record_date: Record date - must be shareholder on this date (YYYY-MM-DD)
+        - pay_date: Payment date - when dividend is paid (YYYY-MM-DD)
+        - frequency: Payment frequency (0, 1, 2, 4, or 12)
+        - dividend_type: Type of dividend (CD, SC, LT, ST)
+
+    Example Usage:
+        - Apple's dividends: list_dividends("AAPL", limit=20)
+        - Recent quarterly dividends: list_dividends(frequency=4, ex_dividend_date="2024-01-01")
+        - Microsoft dividend history: list_dividends("MSFT", limit=50)
+
+    Related Tools:
+        - list_splits: Get stock split history
+        - get_ticker_details: Get comprehensive ticker information
+        - get_aggs: Get price data (use adjusted=True to account for dividends)
     """
     try:
         results = polygon_client.list_dividends(
@@ -678,7 +1328,9 @@ async def list_dividends(
         data_str = results.data.decode("utf-8")
         return json.loads(data_str)
     except Exception as e:
-        return {"error": str(e)}
+        return _build_error_response(
+            e, f"Listing dividends{' for ' + ticker if ticker else ''}"
+        )
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -2361,6 +3013,351 @@ async def get_ticker_events(
     except Exception as e:
         return {"error": str(e)}
 
+
+# ========================================
+# Simplified Wrapper Tools for Common Use Cases
+# ========================================
+# These high-level tools make it easier for LLMs to quickly get
+# common data without needing to understand all the parameters
+
+
+@poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_latest_stock_price(ticker: str) -> Dict[str, Any]:
+    """
+    Get the current/latest price for a stock ticker (simplified).
+
+    This is the easiest way to get a stock's current price. Returns the most recent
+    trade data including price, volume, and timestamp.
+
+    Args:
+        ticker: Stock symbol (e.g., "AAPL", "TSLA", "MSFT")
+
+    Returns:
+        JSON with latest trade info including price, size, timestamp, and conditions
+
+    Example Usage:
+        - get_latest_stock_price("AAPL")
+        - get_latest_stock_price("GOOGL")
+        - get_latest_stock_price("NVDA")
+
+    Related Tools:
+        - get_last_trade: The underlying API this uses
+        - get_simple_quote: Get bid/ask spread instead of last trade
+        - get_snapshot_ticker: Get complete market snapshot
+    """
+    try:
+        return await get_last_trade(ticker=ticker)
+    except Exception as e:
+        return _build_error_response(e, f"Getting latest price for {ticker}")
+
+
+@poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_stock_daily_bars(ticker: str, days_back: int = 30) -> Dict[str, Any]:
+    """
+    Get recent daily price bars for a stock (simplified).
+
+    Returns daily OHLCV data for the last N days. Perfect for quick price history
+    and trend analysis without needing to specify exact dates.
+
+    Args:
+        ticker: Stock symbol (e.g., "AAPL", "TSLA", "MSFT")
+        days_back: Number of days of history to retrieve (default: 30, max: 365)
+
+    Returns:
+        JSON with array of daily bars, each containing open, high, low, close, volume
+
+    Example Usage:
+        - get_stock_daily_bars("AAPL") - Last 30 days
+        - get_stock_daily_bars("TSLA", 90) - Last 90 days
+        - get_stock_daily_bars("MSFT", 7) - Last week
+
+    Related Tools:
+        - get_aggs: More control over time ranges and intervals
+        - get_previous_close_agg: Just yesterday's data
+        - get_daily_open_close_agg: Specific single day
+    """
+    try:
+        # Cap at 365 days
+        days_back = min(days_back, 365)
+        from_date, to_date = _get_date_range_default(days_back)
+
+        return await get_aggs(
+            ticker=ticker,
+            multiplier=1,
+            timespan="day",
+            from_=from_date,
+            to=to_date,
+            adjusted=True,
+            sort="desc",
+            limit=days_back,
+        )
+    except Exception as e:
+        return _build_error_response(e, f"Getting daily bars for {ticker}")
+
+
+@poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_market_movers(
+    direction: str = "gainers", limit: int = 20
+) -> Dict[str, Any]:
+    """
+    Get top market gainers or losers for the day (simplified).
+
+    Quick way to see which stocks are moving the most. Great for market overview
+    and identifying trading opportunities.
+
+    Args:
+        direction: Which movers to get - Options: "gainers" (up) or "losers" (down)
+        limit: Number of results to return (default: 20, max: 250)
+
+    Returns:
+        JSON with snapshot data sorted by percent change, showing biggest movers
+
+    Example Usage:
+        - get_market_movers("gainers") - Top 20 gainers
+        - get_market_movers("losers", 10) - Top 10 losers
+        - get_market_movers("gainers", 50) - Top 50 gainers
+
+    Related Tools:
+        - get_snapshot_direction: The underlying API this uses
+        - get_snapshot_all: All stock snapshots
+        - get_grouped_daily_aggs: Full market daily data
+    """
+    try:
+        return await get_snapshot_direction(
+            market_type="stocks", direction=direction, include_otc=False, limit=limit
+        )
+    except Exception as e:
+        return _build_error_response(e, f"Getting market {direction}")
+
+
+@poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_stock_news_recent(
+    ticker: Optional[str] = None, limit: int = 10
+) -> Dict[str, Any]:
+    """
+    Get recent news articles for a stock or the overall market (simplified).
+
+    Easy way to get the latest news. Omit ticker for general market news, or
+    specify a ticker for company-specific news.
+
+    Args:
+        ticker: Stock symbol for company-specific news (e.g., "AAPL"), or None for market news
+        limit: Number of articles to return (default: 10, max: 50)
+
+    Returns:
+        JSON array of news articles with title, description, publisher, URL, timestamp
+
+    Example Usage:
+        - get_stock_news_recent("AAPL", 5) - Latest 5 Apple news articles
+        - get_stock_news_recent() - Latest 10 general market news
+        - get_stock_news_recent("TSLA", 20) - Latest 20 Tesla articles
+
+    Related Tools:
+        - list_ticker_news: More control over date ranges and filters
+        - get_ticker_details: Company information and fundamentals
+    """
+    try:
+        return await list_ticker_news(
+            ticker=ticker, limit=limit, sort="published_utc", order="desc"
+        )
+    except Exception as e:
+        context = f"Getting news for {ticker}" if ticker else "Getting market news"
+        return _build_error_response(e, context)
+
+
+@poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_simple_quote(ticker: str) -> Dict[str, Any]:
+    """
+    Get current bid/ask quote for a stock (simplified).
+
+    Quick way to see the current bid/ask spread and market depth. Shows what
+    buyers are willing to pay (bid) and what sellers are asking (ask).
+
+    Args:
+        ticker: Stock symbol (e.g., "AAPL", "TSLA", "MSFT")
+
+    Returns:
+        JSON with bid price, ask price, bid size, ask size, and timestamp
+
+    Example Usage:
+        - get_simple_quote("AAPL")
+        - get_simple_quote("GOOGL")
+        - get_simple_quote("MSFT")
+
+    Related Tools:
+        - get_last_quote: The underlying API this uses
+        - get_latest_stock_price: Get last trade instead of quote
+        - list_quotes: Historical quotes over time
+    """
+    try:
+        return await get_last_quote(ticker=ticker)
+    except Exception as e:
+        return _build_error_response(e, f"Getting quote for {ticker}")
+
+
+@poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def check_market_open() -> Dict[str, Any]:
+    """
+    Check if the stock market is currently open (simplified).
+
+    Quick way to see current market status and trading hours for all exchanges.
+    Shows which markets are open/closed and their operating hours.
+
+    Returns:
+        JSON with market status, after/pre-market hours, and exchange-specific statuses
+
+    Example Usage:
+        - check_market_open() - Is the market open right now?
+
+    Related Tools:
+        - get_market_status: The underlying API this uses
+        - get_market_holidays: See upcoming market holidays
+    """
+    try:
+        return await get_market_status()
+    except Exception as e:
+        return _build_error_response(e, "Checking market status")
+
+
+@poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_stock_snapshot(ticker: str) -> Dict[str, Any]:
+    """
+    Get comprehensive current market snapshot for a stock (simplified).
+
+    One call to get everything: current price, today's OHLCV, previous day's data,
+    current quote, and more. Perfect for a complete overview of a stock's status.
+
+    Args:
+        ticker: Stock symbol (e.g., "AAPL", "TSLA", "MSFT")
+
+    Returns:
+        JSON with complete snapshot including:
+        - Latest trade (price, size, time)
+        - Latest quote (bid/ask)
+        - Today's OHLCV data
+        - Previous day's close
+        - Updated timestamp
+
+    Example Usage:
+        - get_stock_snapshot("AAPL")
+        - get_stock_snapshot("NVDA")
+        - get_stock_snapshot("TSLA")
+
+    Related Tools:
+        - get_snapshot_ticker: The underlying API this uses
+        - get_latest_stock_price: Just the price
+        - get_simple_quote: Just the quote
+    """
+    try:
+        return await get_snapshot_ticker(market_type="stocks", ticker=ticker)
+    except Exception as e:
+        return _build_error_response(e, f"Getting snapshot for {ticker}")
+
+
+@poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_crypto_price(
+    crypto: str = "BTC", currency: str = "USD"
+) -> Dict[str, Any]:
+    """
+    Get current cryptocurrency price (simplified).
+
+    Easy way to get crypto prices. Supports major cryptocurrencies against USD
+    and other fiat currencies.
+
+    Args:
+        crypto: Cryptocurrency code (e.g., "BTC", "ETH", "LTC", "DOGE")
+        currency: Fiat currency code (default: "USD", also supports "EUR", "GBP", etc.)
+
+    Returns:
+        JSON with latest crypto trade including price, size, timestamp
+
+    Example Usage:
+        - get_crypto_price("BTC") - Bitcoin in USD
+        - get_crypto_price("ETH", "USD") - Ethereum in USD
+        - get_crypto_price("BTC", "EUR") - Bitcoin in EUR
+
+    Related Tools:
+        - get_last_crypto_trade: The underlying API this uses
+        - get_snapshot_ticker: Full crypto snapshot
+        - get_aggs: Historical crypto price data
+    """
+    try:
+        return await get_last_crypto_trade(from_=crypto, to=currency)
+    except Exception as e:
+        return _build_error_response(e, f"Getting {crypto}/{currency} price")
+
+
+@poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_company_info(ticker: str) -> Dict[str, Any]:
+    """
+    Get detailed company information and fundamentals (simplified).
+
+    One call to get comprehensive company metadata including description, industry,
+    market cap, employee count, website, and more.
+
+    Args:
+        ticker: Stock symbol (e.g., "AAPL", "TSLA", "MSFT")
+
+    Returns:
+        JSON with extensive company details including:
+        - Name and description
+        - Industry and sector
+        - Market cap and share count
+        - Contact info (website, phone, address)
+        - Trading details (primary exchange, currency)
+        - Branding (logo URLs, colors)
+
+    Example Usage:
+        - get_company_info("AAPL")
+        - get_company_info("GOOGL")
+        - get_company_info("TSLA")
+
+    Related Tools:
+        - get_ticker_details: The underlying API this uses
+        - list_stock_financials: Financial statements
+        - list_ticker_news: Company news
+    """
+    try:
+        return await get_ticker_details(ticker=ticker)
+    except Exception as e:
+        return _build_error_response(e, f"Getting company info for {ticker}")
+
+
+@poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def search_stocks(search_term: str, limit: int = 10) -> Dict[str, Any]:
+    """
+    Search for stocks by company name or ticker (simplified).
+
+    Easy way to find tickers when you know the company name but not the symbol.
+    Searches across company names and ticker symbols.
+
+    Args:
+        search_term: Company name or partial ticker to search for (e.g., "Apple", "Tesla", "Micro")
+        limit: Maximum number of results to return (default: 10, max: 100)
+
+    Returns:
+        JSON array of matching tickers with name, symbol, type, market, and other details
+
+    Example Usage:
+        - search_stocks("Apple") - Find Apple Inc.
+        - search_stocks("Tesla", 5) - Find Tesla and related
+        - search_stocks("tech") - Find companies with "tech" in name
+
+    Related Tools:
+        - list_tickers: The underlying API this uses (with more filter options)
+        - get_ticker_details: Get full details after finding ticker
+    """
+    try:
+        return await list_tickers(
+            search=search_term, active=True, limit=limit, order="desc"
+        )
+    except Exception as e:
+        return _build_error_response(e, f"Searching for '{search_term}'")
+
+
+# ========================================
+# Server Startup
+# ========================================
 
 # Directly expose the MCP server object
 # It will be run from entrypoint.py
